@@ -3,9 +3,7 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
-{-# LANGUAGE FunctionalDependencies #-}
 {-# LANGUAGE GADTs #-}
-{-# LANGUAGE KindSignatures #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE PolyKinds #-}
 {-# LANGUAGE RankNTypes #-}
@@ -30,12 +28,12 @@ import GPT2.Loader
 import GPT2.Model (transformerLM)
 import SafeTensors hiding (shape)
 import System.Environment (getArgs)
-import Tiktoken (r50k_base, toRanks)
+import Tiktoken (fromRanks, r50k_base, toRanks)
 import qualified Torch as UT
 import qualified Torch.DType as D
 import Torch.Internal.Cast (cast2)
 import qualified Torch.Internal.Managed.Native as ATen.Managed
-import Torch.Typed hiding (length, sample, transformerLM)
+import Torch.Typed hiding (length, sample, toInt, transformerLM)
 import Unsafe.Coerce (unsafeCoerce)
 
 type family MultinomialCheck (n :: Nat) (shape :: [Nat]) (dim :: Nat) (sat :: Maybe Nat) (result :: Maybe a) :: a where
@@ -99,16 +97,38 @@ infer Dict model tokens =
       @'[1, numTokens]
     $ UT.asTensor tokens
 
+-- Extract the token from the tensor result
+toInt :: Tensor device D.Int64 '[batchSize, 1] -> Int
+toInt tensor = UT.asValue $ UT.toDType D.Int64 $ toDynamic tensor
+
+-- Generate tokens autoregressively
+generate :: Model -> [Int] -> Int -> MaybeT IO [Int]
+generate _ tokens 0 = return tokens
+generate model tokens n =
+  withNat (length tokens) $ \(proxy :: Proxy numTokens) ->
+    case mkNumTokensProof @numTokens proxy of
+      Just dict -> do
+        logits <- lift $ infer @numTokens dict model [map fromIntegral tokens]
+        result <- lift $ sample logits
+        let newToken = toInt result
+        generate model (tokens ++ [newToken]) (n - 1)
+      Nothing -> hoistMaybe Nothing
+
 runInference :: [String] -> MaybeT IO ()
 runInference [] = lift $ putStrLn "No arguments provided"
 runInference [fp :: FilePath] = do
   st <- lift $ readSafeTensors fp
   model <- loadGPT2FromSafeTensors st
-  tokens <- hoistMaybe $ toRanks r50k_base (pack "ab ab ab ab ab ab")
-  withNat (length tokens) $ \(proxy :: Proxy numTokens) ->
-    do
-      dict <- hoistMaybe $ mkNumTokensProof @numTokens proxy
-      lift $ print =<< sample =<< infer @numTokens dict model [map fromIntegral tokens]
+  let inputText = "Hello, I'm a language model,"
+  tokens <- hoistMaybe $ toRanks r50k_base (pack inputText)
+  lift $ putStrLn $ "Input: " ++ inputText
+
+  -- Generate 10 tokens autoregressively
+  generatedTokens <- generate model tokens 10
+
+  -- Convert tokens back to text and display
+  lift $ putStrLn "Generated text:"
+  lift $ print $ fromRanks r50k_base generatedTokens
 runInference (fp : _) = runInference [fp]
 
 main :: IO ()
