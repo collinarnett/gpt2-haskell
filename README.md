@@ -15,6 +15,17 @@ for now.
 1. `nix develop .`
 2. `cabal run inference -- [absolute/path/to/model.safetensors]`
 
+You should see an output similar to the following:
+
+```
+Input: Hello, I'm a language model,
+Generated text:
+Just "Hello, I'm a language model, which means I have a set of features for each"
+```
+
+You can edit `./examples/inference/Main.hs` to change the input or
+number of tokens generated.
+
 ## Developing
 
 1. `nix develop .`
@@ -26,4 +37,3 @@ for now.
 - Test larger gpt2 models
 - Test GPU
 - Implement logging
-- Autoregressive decoding
