@@ -23,8 +23,10 @@ executable inference
     , aeson
     , binary
     , bytestring
-    , constraints
     , ghc
+    , ghc-typelits-extra
+    , ghc-typelits-knownnat
+    , ghc-typelits-natnormalise
     , gpt2-haskell
     , hashmap
     , libtorch-ffi
@@ -33,6 +35,10 @@ executable inference
     , transformers
     , unordered-containers
 
+  ghc-options:
+    -fplugin GHC.TypeLits.Normalise -fplugin
+    GHC.TypeLits.KnownNat.Solver -fplugin GHC.TypeLits.Extra.Solver
+    -fconstraint-solver-iterations=0
+
   main-is:        Main.hs
   hs-source-dirs: inference
-

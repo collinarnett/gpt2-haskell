@@ -1,3 +1,4 @@
+{-# LANGUAGE ConstraintKinds #-}
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE DeriveAnyClass #-}
 {-# LANGUAGE DeriveGeneric #-}
@@ -18,41 +19,31 @@
 
 module GPT2.Model where
 
-import Control.Monad
+import Control.Arrow (arr, (>>>))
+import Control.Category (id)
 import Data.Proxy
-import Debug.Trace
+import Data.Vector.Sized (Vector)
 import GHC.Generics
 import GHC.TypeLits
+import GPT2.Torch.Typed.Functional (geluApproximate)
 import System.IO.Unsafe (unsafePerformIO)
-import qualified Torch as T
 import qualified Torch.DType as D
 import qualified Torch.Device as D
 import Torch.HList
-import Torch.Internal.Cast (cast2)
-import qualified Torch.Internal.Managed.Native as ATen.Managed
 import Torch.NN (HasForward (..))
 import qualified Torch.NN as A
+import qualified Torch.Tensor as UT
 import Torch.Typed.Auxiliary
 import Torch.Typed.Factories
 import Torch.Typed.Functional hiding (linear, log, trace)
+import Torch.Typed.NN.Arrow (Net (..), layer, residual)
 import Torch.Typed.NN.Linear
 import Torch.Typed.NN.Normalization
 import Torch.Typed.NN.Sparse
 import Torch.Typed.Parameter
+import Torch.Typed.Representable (tabulateList)
 import Torch.Typed.Tensor
-import Prelude hiding (cos, exp, sin)
-
-residual f g x = f x >>= (\x' -> g (x `add` x'))
-
-traceTensor ten = trace (show . T.sliceDim 0 0 5 1 . T.select 0 0 . T.squeezeAll $ toDynamic ten) ten
-
-geluApproximate ::
-  forall shape dtype device.
-  (GeluDTypeIsValid device dtype) =>
-  Tensor device dtype shape ->
-  String ->
-  Tensor device dtype shape
-geluApproximate _self _approximate = unsafePerformIO $ cast2 ATen.Managed.gelu_ts _self _approximate
+import Prelude hiding (cos, exp, id, sin)
 
 --------------------------------------------------------------------------------
 -- Relation-Aware Multi-Headed Attention Layer
@@ -105,8 +96,8 @@ multiheadAttention ::
   ) =>
   -- | multi-head attention model ADT
   MultiheadAttention numEmbeds numHeads dtype device ->
-  -- | optional attention mask
-  Maybe (Tensor device dtype '[batchSize, inputSeqLen, inputSeqLen]) ->
+  -- | optional attention mask, broadcast over batch and head
+  Maybe (Tensor device dtype '[inputSeqLen, inputSeqLen]) ->
   -- | query representation
   Tensor device dtype '[batchSize, inputSeqLen, numEmbeds] ->
   -- | key representation
@@ -131,7 +122,7 @@ multiheadAttention MultiheadAttention {..} attentionMask query key value = do
     _maskAttention attentionWeights =
       case attentionMask of
         Nothing -> attentionWeights
-        Just am -> attentionWeights `add` unsqueeze @1 am
+        Just am -> attentionWeights `add` am
     _attention attentionWeights =
       let v = reshape' . forward mhaVInProj $ value
           attention = transpose @1 @2 $ matmul attentionWeights v
@@ -142,6 +133,28 @@ multiheadAttention MultiheadAttention {..} attentionMask query key value = do
       Tensor device dtype '[batchSize, inputSeqLen', numEmbeds] ->
       Tensor device dtype '[batchSize, numHeads, inputSeqLen', headDim]
     reshape' t' = transpose @1 @2 $ reshape @'[batchSize, inputSeqLen', numHeads, headDim] t'
+
+-- | Self-attention as an arrow: the one input is fanned out to query, key and
+-- value.
+selfAttention ::
+  forall numEmbeds numHeads inputSeqLen batchSize headDim dtype device.
+  ( 1 <= numHeads,
+    numEmbeds ~ (headDim * numHeads),
+    All KnownNat '[numEmbeds, numHeads, inputSeqLen, batchSize, headDim],
+    KnownDType dtype,
+    StandardFloatingPointDTypeValidation device dtype,
+    MatMulDTypeIsValid device dtype,
+    BasicArithmeticDTypeIsValid device dtype,
+    dtype ~ SumDType dtype,
+    SumDTypeIsValid device dtype,
+    KnownDevice device
+  ) =>
+  MultiheadAttention numEmbeds numHeads dtype device ->
+  Maybe (Tensor device dtype '[inputSeqLen, inputSeqLen]) ->
+  Net
+    (Tensor device dtype '[batchSize, inputSeqLen, numEmbeds])
+    (Tensor device dtype '[batchSize, inputSeqLen, numEmbeds])
+selfAttention mha attentionMask = Net $ \x -> multiheadAttention mha attentionMask x x x
 
 instance
   ( All KnownNat '[numEmbeds, numEmbeds, numEmbeds, numHeads],
@@ -198,25 +211,27 @@ data
     TransformerMLP numEmbeds ffnDim dtype device
   deriving (Show, Generic, Parameterized)
 
+-- | @x + FF(LN x)@, where @FF@ is the two-layer feed-forward network.
 transformerMLP ::
   forall numEmbeds ffnDim maxSeqLen batchSize dtype device.
   ( BasicArithmeticDTypeIsValid device dtype,
     StandardFloatingPointDTypeValidation device dtype,
     KnownNat numEmbeds,
+    KnownDevice device,
     GeluDTypeIsValid device dtype,
     IsSuffixOf '[numEmbeds] '[maxSeqLen, batchSize, numEmbeds]
   ) =>
   -- | MLP model ADT for transformer
   TransformerMLP numEmbeds ffnDim dtype device ->
-  Tensor device dtype '[maxSeqLen, batchSize, numEmbeds] -> -- input
-  IO (Tensor device dtype '[maxSeqLen, batchSize, numEmbeds]) -- output
-transformerMLP TransformerMLP {..} x =
-  return
-    . (`add` x)
-    . forward linear1
-    . (`geluApproximate` "tanh")
-    . forward linear0
-    $ forward ln x
+  Net
+    (Tensor device dtype '[maxSeqLen, batchSize, numEmbeds])
+    (Tensor device dtype '[maxSeqLen, batchSize, numEmbeds])
+transformerMLP TransformerMLP {..} =
+  residual $
+    layer ln
+      >>> layer linear0
+      >>> arr (`geluApproximate` "tanh")
+      >>> layer linear1
 
 instance
   ( All KnownNat '[numEmbeds, ffnDim],
@@ -275,11 +290,16 @@ data
     TransformerLayer numEmbeds numHeads ffnDim dtype device
   deriving (Show, Generic, Parameterized)
 
+-- | A pre-norm decoder block: attention and feed-forward, each wrapped in a
+-- skip connection.
+--
+-- > x'  = x  + Attend(LN₁ x)
+-- > x'' = x' + FF(LN₂ x')
 transformerLayer ::
   forall (numHeads :: Nat) (ffnDim :: Nat) (numEmbeds :: Nat) (headDim :: Nat) (inputSeqLen :: Nat) (batchSize :: Nat) dtype device.
   ( 1 <= numHeads,
     numEmbeds ~ (headDim * numHeads),
-    All KnownNat '[numEmbeds, numEmbeds, numEmbeds, numHeads, inputSeqLen, batchSize, headDim],
+    All KnownNat '[numEmbeds, numHeads, inputSeqLen, batchSize, headDim],
     IsSuffixOf '[numEmbeds] '[batchSize, inputSeqLen, numEmbeds],
     KnownDType dtype,
     dtype ~ SumDType dtype,
@@ -293,23 +313,14 @@ transformerLayer ::
   -- | transformer layer model ADT
   TransformerLayer numEmbeds numHeads ffnDim dtype device ->
   -- | optional attention mask
-  Maybe (Tensor device dtype '[batchSize, inputSeqLen, inputSeqLen]) ->
-  -- | query representation
-  Tensor device dtype '[batchSize, inputSeqLen, numEmbeds] ->
-  -- | key representation
-  Tensor device dtype '[batchSize, inputSeqLen, numEmbeds] ->
-  -- | value representation
-  Tensor device dtype '[batchSize, inputSeqLen, numEmbeds] ->
-  -- | transformer layer output representation
-  IO (Tensor device dtype '[batchSize, inputSeqLen, numEmbeds])
-transformerLayer TransformerLayer {..} attentionMask query key value =
-  let key' = forward transformerLayer_ln key
-      value' = forward transformerLayer_ln value
-      f query' = multiheadAttention transformerLayer_mha attentionMask query' key' value'
-   in -- _ <- print . T.sliceDim 0 0 5 1 . T.select 0 0 . T.squeezeAll . toDynamic $ fst r
-      do
-        result <- (query `add`) <$> f (forward transformerLayer_ln query)
-        transformerMLP transformerLayer_mlp result
+  Maybe (Tensor device dtype '[inputSeqLen, inputSeqLen]) ->
+  -- | transformer layer as a network
+  Net
+    (Tensor device dtype '[batchSize, inputSeqLen, numEmbeds])
+    (Tensor device dtype '[batchSize, inputSeqLen, numEmbeds])
+transformerLayer TransformerLayer {..} attentionMask =
+  residual (layer transformerLayer_ln >>> selfAttention transformerLayer_mha attentionMask)
+    >>> transformerMLP transformerLayer_mlp
 
 instance
   ( All KnownNat '[numEmbeds, numEmbeds, numEmbeds, numHeads, ffnDim],
@@ -370,8 +381,8 @@ data
       tEmbedding :: Embedding ('Just paddingIdx) vocabSize numEmbeds 'Learned dtype device,
       -- | positional embedding
       tPosEmbedding :: Embedding 'Nothing maxSeqLen numEmbeds 'Constant dtype device,
-      -- | transformer layers
-      tLayers :: HList (HReplicateR numAttnLayers (TransformerLayer numEmbeds numHeads ffnDim dtype device)),
+      -- | transformer layers, in the order they are applied
+      tLayers :: HList (TransformerLayers numAttnLayers numEmbeds numHeads ffnDim dtype device),
       -- | final layer norm
       tFinalLN :: LayerNorm '[numEmbeds] dtype device,
       -- | final output projection
@@ -380,35 +391,27 @@ data
     GPT2 numAttnLayers numHeads ffnDim paddingIdx maxSeqLen vocabSize numEmbeds dtype device
   deriving (Generic)
 
+-- | The stack of identically shaped decoder blocks.
+type TransformerLayers numAttnLayers numEmbeds numHeads ffnDim dtype device =
+  HReplicateR numAttnLayers (TransformerLayer numEmbeds numHeads ffnDim dtype device)
+
 deriving instance
   ( Show
       ( HList
-          ( HReplicateR
+          ( TransformerLayers
               numAttnLayers
-              ( TransformerLayer
-                  numEmbeds
-                  numHeads
-                  ffnDim
-                  dtype
-                  device
-              )
+              numEmbeds
+              numHeads
+              ffnDim
+              dtype
+              device
           )
       )
   ) =>
   Show (GPT2 numAttnLayers numHeads ffnDim paddingIdx maxSeqLen vocabSize numEmbeds dtype device)
 
 instance
-  ( layers
-      ~ ( HReplicateR
-            numAttnLayers
-            ( TransformerLayer
-                numEmbeds
-                numHeads
-                ffnDim
-                dtype
-                device
-            )
-        ),
+  ( layers ~ TransformerLayers numAttnLayers numEmbeds numHeads ffnDim dtype device,
     Parameterized
       ( HList
           layers
@@ -430,14 +433,32 @@ instance
   ) =>
   Parameterized (GPT2 numAttnLayers numHeads ffnDim paddingIdx maxSeqLen vocabSize numEmbeds dtype device)
 
+-- | @M[i, j] = 0@ where position @i@ may attend to position @j@ and @-inf@
+-- where it may not: the causal mask as the formula that defines it.
+causalMask ::
+  forall inputSeqLen dtype device.
+  ( KnownNat inputSeqLen,
+    TensorOptions '[inputSeqLen, inputSeqLen] dtype device,
+    UT.TensorLike (ComputeHaskellType dtype),
+    Fractional (ComputeHaskellType dtype)
+  ) =>
+  Tensor device dtype '[inputSeqLen, inputSeqLen]
+causalMask = toUnnamed (tabulateList @'[Vector inputSeqLen, Vector inputSeqLen] @dtype @device mask)
+  where
+    mask [i, j] = if j <= i then 0 else -1 / 0
+    mask _ = 0
+
+-- | Folds the layer stack into a single network by composing the blocks in
+-- order.
 data
-  FoldLayers
+  ComposeLayers
     (batchSize :: Nat)
     (inputSeqLen :: Nat)
     (dtype :: D.DType)
-    (device :: (D.DeviceType, Nat)) = FoldLayers
+    (device :: (D.DeviceType, Nat))
+  = ComposeLayers
   { -- | optional attention mask
-    flAttentionMask :: Maybe (Tensor device dtype '[batchSize, inputSeqLen, inputSeqLen])
+    clAttentionMask :: Maybe (Tensor device dtype '[inputSeqLen, inputSeqLen])
   }
 
 instance
@@ -455,15 +476,32 @@ instance
     KnownDevice device
   ) =>
   Apply'
-    (FoldLayers batchSize inputSeqLen dtype device)
+    (ComposeLayers batchSize inputSeqLen dtype device)
     ( TransformerLayer numEmbeds numHeads ffnDim dtype device,
-      IO (Tensor device dtype '[batchSize, inputSeqLen, numEmbeds])
+      Net
+        (Tensor device dtype '[batchSize, inputSeqLen, numEmbeds])
+        (Tensor device dtype '[batchSize, inputSeqLen, numEmbeds])
     )
-    (IO (Tensor device dtype '[batchSize, inputSeqLen, numEmbeds]))
+    ( Net
+        (Tensor device dtype '[batchSize, inputSeqLen, numEmbeds])
+        (Tensor device dtype '[batchSize, inputSeqLen, numEmbeds])
+    )
   where
-  apply' FoldLayers {..} (layer, mx) = do
-    x <- mx
-    transformerLayer layer flAttentionMask x x x
+  apply' ComposeLayers {..} (layer', rest) = transformerLayer layer' clAttentionMask >>> rest
+
+-- | The constraint that the layer stack can be folded into one network.
+type ComposableLayers numAttnLayers numEmbeds numHeads ffnDim inputSeqLen batchSize dtype device =
+  HFoldr
+    (ComposeLayers batchSize inputSeqLen dtype device)
+    ( Net
+        (Tensor device dtype '[batchSize, inputSeqLen, numEmbeds])
+        (Tensor device dtype '[batchSize, inputSeqLen, numEmbeds])
+    )
+    (TransformerLayers numAttnLayers numEmbeds numHeads ffnDim dtype device)
+    ( Net
+        (Tensor device dtype '[batchSize, inputSeqLen, numEmbeds])
+        (Tensor device dtype '[batchSize, inputSeqLen, numEmbeds])
+    )
 
 transformerLM ::
   forall
@@ -482,12 +520,10 @@ transformerLM ::
     IsSuffixOf '[numEmbeds] '[batchSize, inputSeqLen, numEmbeds],
     paddingIdx + 1 <= vocabSize,
     1 <= inputSeqLen,
-    HFoldrM
-      IO
-      (FoldLayers batchSize inputSeqLen dtype device)
-      (Tensor device dtype '[batchSize, inputSeqLen, numEmbeds])
-      (HReplicateR numAttnLayers (TransformerLayer numEmbeds numHeads ffnDim dtype device))
-      (Tensor device dtype '[batchSize, inputSeqLen, numEmbeds]),
+    ComposableLayers numAttnLayers numEmbeds numHeads ffnDim inputSeqLen batchSize dtype device,
+    TensorOptions '[inputSeqLen, inputSeqLen] dtype device,
+    UT.TensorLike (ComputeHaskellType dtype),
+    Fractional (ComputeHaskellType dtype),
     BasicArithmeticDTypeIsValid device dtype,
     ComparisonDTypeIsValid device dtype,
     ComparisonDTypeIsValid device 'D.Int64,
@@ -498,29 +534,20 @@ transformerLM ::
   Tensor device 'D.Int64 '[batchSize, inputSeqLen] ->
   IO (Tensor device dtype '[batchSize, inputSeqLen, vocabSize])
 transformerLM GPT2 {..} xTokens = do
-  let x = embed tEmbedding xTokens
-      positions =
+  let positions =
         expand @'[batchSize, inputSeqLen, numEmbeds] True
-          -- . (\pos_emb -> trace (show . T.select 0 0 $ toDynamic pos_emb) pos_emb)
           . embed tPosEmbedding
           . Torch.Typed.Tensor.toDType @D.Int64
           . linspace @inputSeqLen (0 :: Int)
           $ natValI @(inputSeqLen - 1)
-  let x' = x `add` positions
-  let attentionMask =
-        unsqueeze @0
-          . Torch.Typed.Tensor.toDType @D.Bool
-          . triu 1
-          $ ones @'[inputSeqLen, inputSeqLen] @D.Int8 @device
-      attentionMask' =
-        pure . maskedFill attentionMask (-1 / 0 :: Double) $
-          zeros @'[batchSize, inputSeqLen, inputSeqLen] @dtype @device
-  -- _ <- print $ shape x
-  -- _ <- print (T.select 0 0 . T.squeezeAll $ toDynamic x)
-  y <- hfoldrM (FoldLayers attentionMask') x' tLayers
+      x = embed tEmbedding xTokens `add` positions
+      blocks =
+        hfoldr
+          (ComposeLayers @batchSize @inputSeqLen @dtype @device (Just causalMask))
+          (id :: Net (Tensor device dtype '[batchSize, inputSeqLen, numEmbeds]) (Tensor device dtype '[batchSize, inputSeqLen, numEmbeds]))
+          tLayers
+  y <- runNet blocks x
   return
-    -- (\final -> trace (show . T.sliceDim 0 0 5 1 . T.select 0 0 . T.squeezeAll $ toDynamic final) final) $
-    -- (\fin -> trace (show . T.select 0 0 . T.squeezeAll $ toDynamic fin) forward tProj fin) $
     . forward tProj
     $ forward tFinalLN y
 
@@ -529,12 +556,10 @@ instance
     IsSuffixOf '[numEmbeds] '[batchSize, inputSeqLen, numEmbeds],
     paddingIdx + 1 <= vocabSize,
     1 <= inputSeqLen,
-    HFoldrM
-      IO
-      (FoldLayers batchSize inputSeqLen dtype device)
-      (Tensor device dtype '[batchSize, inputSeqLen, numEmbeds])
-      (HReplicateR numAttnLayers (TransformerLayer numEmbeds numHeads ffnDim dtype device))
-      (Tensor device dtype '[batchSize, inputSeqLen, numEmbeds]),
+    ComposableLayers numAttnLayers numEmbeds numHeads ffnDim inputSeqLen batchSize dtype device,
+    TensorOptions '[inputSeqLen, inputSeqLen] dtype device,
+    UT.TensorLike (ComputeHaskellType dtype),
+    Fractional (ComputeHaskellType dtype),
     BasicArithmeticDTypeIsValid device dtype,
     ComparisonDTypeIsValid device dtype,
     ComparisonDTypeIsValid device 'D.Int64,
@@ -582,7 +607,7 @@ instance
     HReplicate numAttnLayers (TransformerLayerSpec numEmbeds numHeads ffnDim dtype device),
     A.Randomizable
       (HList (HReplicateR numAttnLayers (TransformerLayerSpec numEmbeds numHeads ffnDim dtype device)))
-      (HList (HReplicateR numAttnLayers (TransformerLayer numEmbeds numHeads ffnDim dtype device))),
+      (HList (TransformerLayers numAttnLayers numEmbeds numHeads ffnDim dtype device)),
     KnownDType dtype,
     RandDTypeIsValid device dtype,
     StandardFloatingPointDTypeValidation device 'D.Float,
