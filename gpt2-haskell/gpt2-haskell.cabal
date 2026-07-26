@@ -35,6 +35,7 @@ library
     , libtorch-ffi-helper
     , safe-exceptions
     , transformers
+    , vector-sized
 
   hs-source-dirs:  src
   ghc-options:
@@ -46,4 +47,5 @@ library
     GPT2
     GPT2.Loader
     GPT2.Model
+    GPT2.Torch.Typed.Functional
     SafeTensors

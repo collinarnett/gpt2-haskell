@@ -224,13 +224,13 @@ loadGPT2FromSafeTensors ::
 loadGPT2FromSafeTensors st = do
   tokenEmbeddings <- hoistMaybe $ lookupWithSafeTensorKey "wte.weight" st
   posEmbeddings <- hoistMaybe $ lookupWithSafeTensorKey "wpe.weight" st
-  mlpLayers <- mapM (getMLPParameters st) [11, 10 .. 0]
-  attnLayers <- mapM (getAttnParameters st) [11, 10 .. 0]
-  transformerLayerNorms <- mapM (getTransformerLayerNorms st) [11, 10 .. 0]
+  mlpLayers <- mapM (getMLPParameters st) [0 .. 11]
+  attnLayers <- mapM (getAttnParameters st) [0 .. 11]
+  transformerLayerNorms <- mapM (getTransformerLayerNorms st) [0 .. 11]
   finalLayerNormWeight <- hoistMaybe $ lookupWithSafeTensorKey "ln_f.weight" st
   finalLayerNormBias <- hoistMaybe $ lookupWithSafeTensorKey "ln_f.bias" st
   transformerLayers <- liftIO $ zipWith3M mkTransformerLayer attnLayers transformerLayerNorms mlpLayers
-  let layers = (fromList transformerLayers :: Maybe (HList (HReplicateR NumHeads (TransformerLayer NumEmbeds NumHeads FFNDim D.Float ModelDevice))))
+  let layers = (fromList transformerLayers :: Maybe (HList (TransformerLayers NumAttnLayers NumEmbeds NumHeads FFNDim D.Float ModelDevice)))
   sharedParams <- liftIO $ mkTokEmbeddings tokenEmbeddings
   zeroBias <- liftIO $ makeIndependent $ zeros @'[VocabSize] @'D.Float @ModelDevice
   GPT2 sharedParams

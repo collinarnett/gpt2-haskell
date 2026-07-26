@@ -20,81 +20,54 @@ module Main where
 import Control.Monad.Trans.Class (lift)
 import Control.Monad.Trans.Maybe
 import Data.ByteString.Char8 (pack)
-import Data.Constraint
 import Data.Proxy
 import GHC.Int (Int64)
 import GHC.TypeLits
 import GPT2.Loader
 import GPT2.Model (transformerLM)
+import GPT2.Torch.Typed.Functional (multinomial)
 import SafeTensors hiding (shape)
 import System.Environment (getArgs)
 import Tiktoken (fromRanks, r50k_base, toRanks)
 import qualified Torch as UT
 import qualified Torch.DType as D
-import Torch.Internal.Cast (cast2)
-import qualified Torch.Internal.Managed.Native as ATen.Managed
 import Torch.Typed hiding (length, sample, toInt, transformerLM)
-import Unsafe.Coerce (unsafeCoerce)
+import Torch.Typed.Index (IndexType (..), getSlice)
 
-type family MultinomialCheck (n :: Nat) (shape :: [Nat]) (dim :: Nat) (sat :: Maybe Nat) (result :: Maybe a) :: a where
-  MultinomialCheck _ shape dim _ Nothing = DimOutOfBound shape dim
-  MultinomialCheck _ shape dim Nothing _ = DimOutOfBound shape dim
-  MultinomialCheck n shape dim (Just v) (Just result) = If (n <=? v) result (TypeError (Text "n must be less than or equal to the number of elements in the first dim."))
-
-type Multinomial n shape dim = MultinomialCheck n shape dim (ExtractDim dim shape) (ReplaceDim dim shape n)
-
-multinomial ::
-  forall samples dim shape shape' device.
-  ( KnownNat samples,
-    KnownNat dim,
-    shape' ~ Multinomial samples shape dim,
-    KnownDevice device
-  ) =>
-  Tensor device 'Float shape ->
-  IO (Tensor device 'Int64 shape')
-multinomial t' = cast2 ATen.Managed.multinomial_tl t' (natValI @samples)
-
+-- | Sample one token from the distribution the model predicts for the last
+-- position, restricted to its ten most likely continuations.
+--
+-- The context is described by the index of its last position, so the slice
+-- @tensor[:, lastIdx]@ is in bounds by construction and 'getSlice' computes
+-- the result shape at compile time.
 sample ::
-  forall numTokens batchSize shape device dtype.
-  ( All KnownNat [batchSize, numTokens],
-    shape ~ [batchSize, numTokens, VocabSize],
+  forall lastIdx batchSize device dtype.
+  ( All KnownNat [batchSize, lastIdx],
     dtype ~ D.Float,
     StandardFloatingPointDTypeValidation device dtype,
     KnownDevice device
   ) =>
-  Tensor device dtype shape ->
+  Tensor device dtype '[batchSize, lastIdx + 1, VocabSize] ->
   IO (Tensor device D.Int64 '[batchSize, 1])
 sample tensor' = do
   ix <- multinomial @1 @1 topk_probs
   return $ gatherDim @1 ix topk_indices
   where
-    logits = selectIdx @1 tensor' $ fromIntegral $ natValI @numTokens - 1
+    logits = getSlice @'[ 'SliceAll, 'SliceAt lastIdx] tensor'
     (topk_probs, topk_indices) = topk @10 @1 True True $ softmax @1 logits
 
-mkNumTokensProof ::
-  forall (numTokens :: Nat).
-  (KnownNat numTokens) =>
-  Data.Proxy.Proxy numTokens ->
-  Maybe (Dict ((1 <=? numTokens) ~ 'True))
-mkNumTokensProof Proxy =
-  let numEmbeds = natValI @numTokens
-   in if numEmbeds > 0
-        then Just (unsafeCoerce (Dict :: Dict ('True ~ 'True)))
-        else Nothing
-
 infer ::
-  forall (numTokens :: Nat).
-  (KnownNat numTokens) =>
-  Dict ((1 <=? numTokens) ~ 'True) ->
+  forall lastIdx.
+  (KnownNat lastIdx) =>
   Model ->
   [[Int64]] ->
-  IO (Tensor ModelDevice UT.Float '[1, numTokens, VocabSize])
-infer Dict model tokens =
+  IO (Tensor ModelDevice UT.Float '[1, lastIdx + 1, VocabSize])
+infer model tokens =
   transformerLM model
     $ UnsafeMkTensor
       @ModelDevice
       @D.Int64
-      @'[1, numTokens]
+      @'[1, lastIdx + 1]
     $ UT.asTensor tokens
 
 -- Extract the token from the tensor result
@@ -104,15 +77,13 @@ toInt tensor = UT.asValue $ UT.toDType D.Int64 $ toDynamic tensor
 -- Generate tokens autoregressively
 generate :: Model -> [Int] -> Int -> MaybeT IO [Int]
 generate _ tokens 0 = return tokens
+generate _ [] _ = hoistMaybe Nothing
 generate model tokens n =
-  withNat (length tokens) $ \(proxy :: Proxy numTokens) ->
-    case mkNumTokensProof @numTokens proxy of
-      Just dict -> do
-        logits <- lift $ infer @numTokens dict model [map fromIntegral tokens]
-        result <- lift $ sample logits
-        let newToken = toInt result
-        generate model (tokens ++ [newToken]) (n - 1)
-      Nothing -> hoistMaybe Nothing
+  withNat (length tokens - 1) $ \(Proxy :: Proxy lastIdx) -> do
+    logits <- lift $ infer @lastIdx model [map fromIntegral tokens]
+    result <- lift $ sample @lastIdx logits
+    let newToken = toInt result
+    generate model (tokens ++ [newToken]) (n - 1)
 
 runInference :: [String] -> MaybeT IO ()
 runInference [] = lift $ putStrLn "No arguments provided"
